@@ -1210,6 +1210,64 @@ const zeroEntropyCompatFetch = (async (input: RequestInfo | URL, init?: RequestI
  * fetch (voyage, zeroentropyai, azure) never reach this shim: the
  * `compat.fetch ??` precedence in instantiateEmbedding wins.
  */
+/**
+ * 302.ai's OpenAI-compat proxy rejects ARRAY `input` for
+ * gemini-embedding-001 — HTTP 500 even for a 1-element array; only a bare
+ * string works. The AI SDK always sends `input` as an array, so this shim
+ * fans a batched embeddings request out into one request per text (bare
+ * string input) and reassembles the OpenAI response shape. Selected only
+ * for litellm + gemini-embedding-001 in instantiateEmbedding; that model
+ * is symmetric, so skipping the asymmetric input_type shim there is safe.
+ */
+const gemini302SingleEmbedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  if (typeof input !== 'string' && !(input instanceof URL)) return fetch(input as any, init);
+  if (!init?.body || typeof init.body !== 'string') return fetch(input as any, init);
+  let parsed: any;
+  try {
+    parsed = JSON.parse(init.body);
+  } catch {
+    return fetch(input as any, init);
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.input)) {
+    return fetch(input as any, init);
+  }
+  const url = typeof input === 'string' ? input : input.toString();
+  const single = (text: unknown) => {
+    const headers = new Headers(init.headers ?? {});
+    headers.delete('content-length');
+    return fetch(url, { ...init, body: JSON.stringify({ ...parsed, input: text }), headers });
+  };
+  if (parsed.input.length === 1) return single(parsed.input[0]);
+  // ponytail: sequential fan-out; parallelize if embed throughput ever matters
+  const data: any[] = [];
+  let model: string | undefined;
+  let totalTokens = 0;
+  for (let i = 0; i < parsed.input.length; i++) {
+    const res = await single(parsed.input[i]);
+    if (!res.ok) return res;
+    const json: any = await res.json();
+    const item = json?.data?.[0];
+    if (!item) {
+      return new Response(JSON.stringify(json), {
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    data.push({ ...item, index: i });
+    model = json?.model ?? model;
+    totalTokens += json?.usage?.total_tokens ?? 0;
+  }
+  return new Response(
+    JSON.stringify({
+      object: 'list',
+      data,
+      model: model ?? parsed.model,
+      usage: { prompt_tokens: totalTokens, total_tokens: totalTokens },
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  );
+}) as unknown as typeof fetch;
+
 const openAICompatAsymmetricFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const threadedInputType = __embedInputTypeStore.getStore();
   if (threadedInputType === undefined) return fetch(input as any, init);
@@ -1301,7 +1359,9 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       // change.
       const fetchWrapper =
         compat.fetch ??
-        (recipe.id === 'voyage'
+        (recipe.id === 'litellm' && modelId === 'gemini-embedding-001'
+          ? gemini302SingleEmbedFetch
+          : recipe.id === 'voyage'
           ? voyageCompatFetch
           : recipe.id === 'zeroentropyai'
           ? zeroEntropyCompatFetch
